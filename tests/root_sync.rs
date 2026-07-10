@@ -2,6 +2,7 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use matr_project_file_manager::db::{queries, Db};
+use matr_project_file_manager::model::ExtensionRules;
 use matr_project_file_manager::scanner;
 
 fn tempdir(label: &str) -> std::path::PathBuf {
@@ -27,7 +28,7 @@ fn untracked_folders_under_root_are_adopted_as_projects() {
     fs::create_dir_all(&folder_b).unwrap();
     fs::write(folder_b.join("notes.txt"), "x").unwrap();
 
-    let discovered = scanner::sync_root_directory(&mut db.conn, &root).unwrap();
+    let discovered = scanner::sync_root_directory(&mut db.conn, &root, &ExtensionRules::default()).unwrap();
     assert_eq!(discovered, 2);
 
     let projects = queries::list_projects(&db.conn).unwrap();
@@ -43,7 +44,7 @@ fn untracked_folders_under_root_are_adopted_as_projects() {
     let mug_files = queries::files_for_project(&db.conn, mug_project.id).unwrap();
     assert_eq!(mug_files.len(), 1);
 
-    let discovered_again = scanner::sync_root_directory(&mut db.conn, &root).unwrap();
+    let discovered_again = scanner::sync_root_directory(&mut db.conn, &root, &ExtensionRules::default()).unwrap();
     assert_eq!(discovered_again, 0);
     assert_eq!(queries::list_projects(&db.conn).unwrap().len(), 2);
 }
@@ -59,10 +60,10 @@ fn adopted_folder_seed_matches_rip_output() {
     fs::create_dir_all(&folder).unwrap();
     fs::write(folder.join("mug.png"), "x").unwrap();
 
-    scanner::sync_root_directory(&mut db.conn, &root).unwrap();
+    scanner::sync_root_directory(&mut db.conn, &root, &ExtensionRules::default()).unwrap();
 
     fs::write(rip_dir.join("mug-0.prt"), "job").unwrap();
-    scanner::scan_rip_directory(&mut db.conn, &rip_dir).unwrap();
+    scanner::scan_relevant_directories(&mut db.conn, &[rip_dir.clone()], &ExtensionRules::default()).unwrap();
 
     let project = queries::list_projects(&db.conn).unwrap().into_iter().next().unwrap();
     let files = queries::files_for_project(&db.conn, project.id).unwrap();
@@ -79,17 +80,17 @@ fn deleting_a_project_folder_removes_it_from_the_list() {
     let folder = root.join("mug");
     fs::create_dir_all(&folder).unwrap();
     fs::write(folder.join("mug.png"), "x").unwrap();
-    scanner::sync_root_directory(&mut db.conn, &root).unwrap();
+    scanner::sync_root_directory(&mut db.conn, &root, &ExtensionRules::default()).unwrap();
 
     fs::write(rip_dir.join("mug-0.prt"), "job").unwrap();
-    scanner::scan_rip_directory(&mut db.conn, &rip_dir).unwrap();
+    scanner::scan_relevant_directories(&mut db.conn, &[rip_dir.clone()], &ExtensionRules::default()).unwrap();
 
     let project = queries::list_projects(&db.conn).unwrap().into_iter().next().unwrap();
     let matched_before = queries::rip_files_matched_to_project(&db.conn, project.id).unwrap();
     assert_eq!(matched_before.len(), 1, "mug-0.prt matched before the folder was removed");
 
     fs::remove_dir_all(&folder).unwrap();
-    scanner::sync_root_directory(&mut db.conn, &root).unwrap();
+    scanner::sync_root_directory(&mut db.conn, &root, &ExtensionRules::default()).unwrap();
 
     let projects = queries::list_projects(&db.conn).unwrap();
     assert!(projects.is_empty(), "project must disappear once its folder is gone");

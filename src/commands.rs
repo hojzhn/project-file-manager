@@ -5,9 +5,11 @@ use crate::model::{Project, ProjectFileView, ProjectId, RipFileId, Settings};
 #[derive(Debug, Clone)]
 pub enum Command {
     GetSettings,
-    SetDirectories {
+    SaveSettings {
         root_directory: PathBuf,
-        rip_directory: PathBuf,
+        relevant_directories: Vec<PathBuf>,
+        parent_extensions: Vec<String>,
+        child_extensions: Vec<String>,
     },
     ListProjects,
     CreateProjectFromImage {
@@ -23,7 +25,7 @@ pub enum Command {
         project_id: ProjectId,
     },
     SyncRootDirectory,
-    RescanRipDirectory,
+    SyncRelevantDirectories,
     MoveRipFileIntoProject {
         rip_file_id: RipFileId,
     },
@@ -47,5 +49,5 @@ pub enum UiEvent {
 #[derive(Debug, Clone)]
 pub enum WatchEvent {
     RootChanged,
-    RipChanged,
+    RelevantChanged,
 }

@@ -4,7 +4,7 @@ use eframe::egui::Context;
 use crate::commands::{Command, UiEvent, WatchEvent};
 use crate::db::{queries, Db};
 use crate::error::{AppError, AppResult};
-use crate::model::ProjectId;
+use crate::model::{ExtensionRules, ProjectId};
 use crate::organize;
 use crate::paths;
 use crate::scanner;
@@ -31,12 +31,16 @@ pub fn spawn(
 
         if let Ok(settings) = queries::get_settings(&db.conn) {
             if let Some(root) = &settings.root_directory {
-                let _ = scanner::sync_root_directory(&mut db.conn, root);
+                let _ = scanner::sync_root_directory(&mut db.conn, root, &settings.extension_rules);
                 watchers.watch_root(root, watch_tx.clone());
             }
-            if let Some(rip) = &settings.rip_directory {
-                let _ = scanner::scan_rip_directory(&mut db.conn, rip);
-                watchers.watch_rip(rip, watch_tx.clone());
+            if !settings.relevant_directories.is_empty() {
+                let _ = scanner::scan_relevant_directories(
+                    &mut db.conn,
+                    &settings.relevant_directories,
+                    &settings.extension_rules,
+                );
+                watchers.watch_relevant_directories(&settings.relevant_directories, watch_tx.clone());
             }
         }
         send_projects(&db, &ui_event_tx, &ctx);
@@ -53,8 +57,8 @@ pub fn spawn(
                             emit(&ui_event_tx, &ctx, UiEvent::Error(e.to_string()));
                         }
                     }
-                    Ok(WatchEvent::RipChanged) => {
-                        if let Err(e) = sync_rip_and_refresh(&mut db, &ui_event_tx, &ctx) {
+                    Ok(WatchEvent::RelevantChanged) => {
+                        if let Err(e) = sync_relevant_and_refresh(&mut db, &ui_event_tx, &ctx) {
                             emit(&ui_event_tx, &ctx, UiEvent::Error(e.to_string()));
                         }
                     }
@@ -93,7 +97,7 @@ fn send_files_for_project(db: &Db, project_id: ProjectId, tx: &Sender<UiEvent>, 
 fn sync_root_and_refresh(db: &mut Db, tx: &Sender<UiEvent>, ctx: &Context) -> AppResult<()> {
     let settings = queries::get_settings(&db.conn)?;
     let root = settings.root_directory.ok_or(AppError::DirectoriesNotConfigured)?;
-    scanner::sync_root_directory(&mut db.conn, &root)?;
+    scanner::sync_root_directory(&mut db.conn, &root, &settings.extension_rules)?;
     send_projects(db, tx, ctx);
     for project in queries::list_projects(&db.conn)? {
         send_files_for_project(db, project.id, tx, ctx)?;
@@ -101,10 +105,12 @@ fn sync_root_and_refresh(db: &mut Db, tx: &Sender<UiEvent>, ctx: &Context) -> Ap
     Ok(())
 }
 
-fn sync_rip_and_refresh(db: &mut Db, tx: &Sender<UiEvent>, ctx: &Context) -> AppResult<()> {
+fn sync_relevant_and_refresh(db: &mut Db, tx: &Sender<UiEvent>, ctx: &Context) -> AppResult<()> {
     let settings = queries::get_settings(&db.conn)?;
-    let rip_dir = settings.rip_directory.ok_or(AppError::DirectoriesNotConfigured)?;
-    scanner::scan_rip_directory(&mut db.conn, &rip_dir)?;
+    if settings.relevant_directories.is_empty() {
+        return Err(AppError::DirectoriesNotConfigured);
+    }
+    scanner::scan_relevant_directories(&mut db.conn, &settings.relevant_directories, &settings.extension_rules)?;
     for project in queries::list_projects(&db.conn)? {
         send_files_for_project(db, project.id, tx, ctx)?;
     }
@@ -135,17 +141,26 @@ fn run_command(
     match cmd {
         Command::GetSettings => send_settings(db, tx, ctx),
 
-        Command::SetDirectories { root_directory, rip_directory } => {
+        Command::SaveSettings { root_directory, relevant_directories, parent_extensions, child_extensions } => {
             let root_directory = paths::canonicalize(&root_directory)?;
             std::fs::create_dir_all(&root_directory)?;
-            let rip_directory = paths::canonicalize(&rip_directory)?;
-            let settings = queries::set_directories(&db.conn, &root_directory, &rip_directory)?;
-            emit(tx, ctx, UiEvent::Settings(settings));
+            let relevant_directories = relevant_directories
+                .iter()
+                .map(|dir| paths::canonicalize(dir))
+                .collect::<AppResult<Vec<_>>>()?;
+            let extension_rules = ExtensionRules { parent_extensions, child_extensions };
 
-            scanner::scan_rip_directory(&mut db.conn, &rip_directory)?;
-            scanner::sync_root_directory(&mut db.conn, &root_directory)?;
+            queries::set_root_directory(&db.conn, &root_directory)?;
+            queries::replace_relevant_directories(&db.conn, &relevant_directories)?;
+            queries::set_extension_rules(&db.conn, &extension_rules)?;
+
+            let settings = queries::get_settings(&db.conn)?;
+            emit(tx, ctx, UiEvent::Settings(settings.clone()));
+
+            scanner::scan_relevant_directories(&mut db.conn, &settings.relevant_directories, &settings.extension_rules)?;
+            scanner::sync_root_directory(&mut db.conn, &root_directory, &settings.extension_rules)?;
             watchers.watch_root(&root_directory, watch_tx.clone());
-            watchers.watch_rip(&rip_directory, watch_tx.clone());
+            watchers.watch_relevant_directories(&settings.relevant_directories, watch_tx.clone());
 
             send_projects(db, tx, ctx);
         }
@@ -184,7 +199,7 @@ fn run_command(
                 Some(&seed_basename),
             )?;
 
-            scanner::scan_project_home(&mut db.conn, &project)?;
+            scanner::scan_project_home(&mut db.conn, &project, &settings.extension_rules)?;
             queries::rematch_rip_files(&db.conn)?;
 
             emit(tx, ctx, UiEvent::ProjectCreated(project.clone()));
@@ -205,7 +220,7 @@ fn run_command(
                 .unwrap_or(name);
             let project = queries::create_project(&db.conn, &folder_name, &folder_path, None, None)?;
 
-            scanner::scan_project_home(&mut db.conn, &project)?;
+            scanner::scan_project_home(&mut db.conn, &project, &settings.extension_rules)?;
 
             emit(tx, ctx, UiEvent::ProjectCreated(project.clone()));
             send_projects(db, tx, ctx);
@@ -218,33 +233,37 @@ fn run_command(
 
         Command::RescanProject { project_id } => {
             let project = queries::get_project(&db.conn, project_id)?.ok_or(AppError::ProjectNotFound(project_id))?;
-            scanner::scan_project_home(&mut db.conn, &project)?;
+            let settings = queries::get_settings(&db.conn)?;
+            scanner::scan_project_home(&mut db.conn, &project, &settings.extension_rules)?;
+            queries::rematch_rip_files(&db.conn)?;
             send_files_for_project(db, project_id, tx, ctx)?;
         }
 
         Command::SyncRootDirectory => sync_root_and_refresh(db, tx, ctx)?,
 
-        Command::RescanRipDirectory => sync_rip_and_refresh(db, tx, ctx)?,
+        Command::SyncRelevantDirectories => sync_relevant_and_refresh(db, tx, ctx)?,
 
         Command::MoveRipFileIntoProject { rip_file_id } => {
             let rip_file = queries::get_rip_file(&db.conn, rip_file_id)?
                 .ok_or(AppError::RipFileNotFound(rip_file_id))?;
             let project_id = rip_file.matched_project_id.ok_or(AppError::RipFileNotFound(rip_file_id))?;
             let project = queries::get_project(&db.conn, project_id)?.ok_or(AppError::ProjectNotFound(project_id))?;
+            let settings = queries::get_settings(&db.conn)?;
 
             organize::move_rip_file_into_project(&mut db.conn, &rip_file, &project)?;
-            scanner::scan_project_home(&mut db.conn, &project)?;
+            scanner::scan_project_home(&mut db.conn, &project, &settings.extension_rules)?;
             send_files_for_project(db, project_id, tx, ctx)?;
         }
 
         Command::MoveAllMatchedIntoProject { project_id } => {
             let project = queries::get_project(&db.conn, project_id)?.ok_or(AppError::ProjectNotFound(project_id))?;
+            let settings = queries::get_settings(&db.conn)?;
             let matched = queries::rip_files_matched_to_project(&db.conn, project_id)?;
             for rip_file in &matched {
                 organize::move_rip_file_into_project(&mut db.conn, rip_file, &project)?;
             }
             if !matched.is_empty() {
-                scanner::scan_project_home(&mut db.conn, &project)?;
+                scanner::scan_project_home(&mut db.conn, &project, &settings.extension_rules)?;
             }
             send_files_for_project(db, project_id, tx, ctx)?;
         }

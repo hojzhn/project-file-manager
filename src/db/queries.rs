@@ -5,8 +5,8 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    FileSource, HomeFile, HomeFileId, Project, ProjectFileView, ProjectId, RipFile, RipFileId,
-    Settings,
+    ExtensionRules, FileSource, HomeFile, HomeFileId, Project, ProjectFileView, ProjectId, RipFile,
+    RipFileId, Settings,
 };
 
 fn parse_dt(s: &str) -> DateTime<Utc> {
@@ -19,26 +19,65 @@ fn opt_path(s: Option<String>) -> Option<PathBuf> {
     s.map(PathBuf::from)
 }
 
-pub fn get_settings(conn: &Connection) -> AppResult<Settings> {
-    conn.query_row(
-        "SELECT root_directory, rip_directory FROM settings WHERE id = 1",
-        [],
-        |row| {
-            Ok(Settings {
-                root_directory: opt_path(row.get(0)?),
-                rip_directory: opt_path(row.get(1)?),
-            })
-        },
-    )
-    .map_err(AppError::from)
+fn split_ext_list(s: &str) -> Vec<String> {
+    s.split(',').map(|e| e.trim().to_ascii_lowercase()).filter(|e| !e.is_empty()).collect()
 }
 
-pub fn set_directories(conn: &Connection, root: &Path, rip: &Path) -> AppResult<Settings> {
-    conn.execute(
-        "UPDATE settings SET root_directory = ?1, rip_directory = ?2 WHERE id = 1",
-        params![root.to_string_lossy(), rip.to_string_lossy()],
+fn join_ext_list(list: &[String]) -> String {
+    list.iter().map(|e| e.trim().to_ascii_lowercase()).collect::<Vec<_>>().join(",")
+}
+
+pub fn get_settings(conn: &Connection) -> AppResult<Settings> {
+    let (root_directory, extension_rules) = conn.query_row(
+        "SELECT root_directory, parent_extensions, child_extensions FROM settings WHERE id = 1",
+        [],
+        |row| {
+            let parent_extensions: String = row.get(1)?;
+            let child_extensions: String = row.get(2)?;
+            Ok((
+                opt_path(row.get(0)?),
+                ExtensionRules {
+                    parent_extensions: split_ext_list(&parent_extensions),
+                    child_extensions: split_ext_list(&child_extensions),
+                },
+            ))
+        },
     )?;
-    get_settings(conn)
+    let relevant_directories = list_relevant_directories(conn)?;
+    Ok(Settings { root_directory, relevant_directories, extension_rules })
+}
+
+pub fn set_root_directory(conn: &Connection, root: &Path) -> AppResult<()> {
+    conn.execute(
+        "UPDATE settings SET root_directory = ?1 WHERE id = 1",
+        params![root.to_string_lossy()],
+    )?;
+    Ok(())
+}
+
+pub fn list_relevant_directories(conn: &Connection) -> AppResult<Vec<PathBuf>> {
+    let mut stmt = conn.prepare("SELECT path FROM relevant_directories ORDER BY id")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.map(|r| r.map(PathBuf::from).map_err(AppError::from)).collect()
+}
+
+pub fn replace_relevant_directories(conn: &Connection, dirs: &[PathBuf]) -> AppResult<()> {
+    conn.execute("DELETE FROM relevant_directories", [])?;
+    for dir in dirs {
+        conn.execute(
+            "INSERT OR IGNORE INTO relevant_directories (path) VALUES (?1)",
+            params![dir.to_string_lossy()],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn set_extension_rules(conn: &Connection, rules: &ExtensionRules) -> AppResult<()> {
+    conn.execute(
+        "UPDATE settings SET parent_extensions = ?1, child_extensions = ?2 WHERE id = 1",
+        params![join_ext_list(&rules.parent_extensions), join_ext_list(&rules.child_extensions)],
+    )?;
+    Ok(())
 }
 
 fn project_from_row(row: &Row) -> rusqlite::Result<Project> {
@@ -136,6 +175,7 @@ fn home_file_from_row(row: &Row) -> rusqlite::Result<HomeFile> {
         created_at: parse_dt(&created_at),
         modified_at: parse_dt(&modified_at),
         missing: row.get::<_, i64>("missing")? != 0,
+        base_name: row.get("base_name")?,
     })
 }
 
@@ -147,6 +187,7 @@ pub struct ScannedFile {
     pub size_bytes: u64,
     pub created_at: DateTime<Utc>,
     pub modified_at: DateTime<Utc>,
+    pub base_name: Option<String>,
 }
 
 pub fn reconcile_home_files(
@@ -160,8 +201,8 @@ pub fn reconcile_home_files(
     {
         let mut upsert = tx.prepare(
             "INSERT INTO home_files (project_id, abs_path, relative_path, file_name, ext,
-                                      size_bytes, created_at, modified_at, missing, last_seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)
+                                      size_bytes, created_at, modified_at, missing, base_name, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10)
              ON CONFLICT(abs_path) DO UPDATE SET
                 project_id = excluded.project_id,
                 relative_path = excluded.relative_path,
@@ -171,6 +212,7 @@ pub fn reconcile_home_files(
                 created_at = excluded.created_at,
                 modified_at = excluded.modified_at,
                 missing = 0,
+                base_name = excluded.base_name,
                 last_seen_at = excluded.last_seen_at",
         )?;
         for f in scanned {
@@ -183,6 +225,7 @@ pub fn reconcile_home_files(
                 f.size_bytes as i64,
                 f.created_at.to_rfc3339(),
                 f.modified_at.to_rfc3339(),
+                f.base_name,
                 now,
             ])?;
         }
@@ -272,15 +315,17 @@ pub fn rematch_rip_files(conn: &Connection) -> AppResult<usize> {
     conn.execute(
         "UPDATE rip_files
          SET matched_project_id = (
-             SELECT p.id FROM projects p
-             WHERE p.seed_basename = rip_files.base_name AND p.archived = 0
-             ORDER BY p.created_at DESC
+             SELECT hf.project_id FROM home_files hf
+             JOIN projects p ON p.id = hf.project_id
+             WHERE hf.base_name = rip_files.base_name AND p.archived = 0 AND hf.missing = 0
+             ORDER BY hf.created_at DESC
              LIMIT 1
          )
          WHERE matched_project_id IS NULL
            AND EXISTS (
-             SELECT 1 FROM projects p
-             WHERE p.seed_basename = rip_files.base_name AND p.archived = 0
+             SELECT 1 FROM home_files hf
+             JOIN projects p ON p.id = hf.project_id
+             WHERE hf.base_name = rip_files.base_name AND p.archived = 0 AND hf.missing = 0
            )",
         [],
     )
@@ -323,6 +368,7 @@ pub fn files_for_project(conn: &Connection, project_id: ProjectId) -> AppResult<
             size_bytes: f.size_bytes,
             created_at: f.created_at,
             modified_at: f.modified_at,
+            base_name: f.base_name,
         })
         .collect();
 
@@ -336,6 +382,7 @@ pub fn files_for_project(conn: &Connection, project_id: ProjectId) -> AppResult<
         size_bytes: f.size_bytes,
         created_at: f.created_at,
         modified_at: f.modified_at,
+        base_name: Some(f.base_name),
     }));
 
     views.sort_by(|a, b| a.file_name.cmp(&b.file_name));

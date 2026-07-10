@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
@@ -6,57 +6,93 @@ use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 
 use crate::commands::{Command, UiEvent};
-use crate::model::{FileSource, Project, ProjectFileView, ProjectId, Settings, IMAGE_EXTENSIONS};
+use crate::model::{ExtensionRules, FileSource, Project, ProjectFileView, ProjectId, Settings};
+use crate::scanner::base_name_of;
 
 struct Iteration {
     label: String,
-    prt: Option<ProjectFileView>,
-    bmp: Option<ProjectFileView>,
+    files: Vec<ProjectFileView>,
 }
 
-fn group_files<'a>(
-    project: &Project,
-    files: &'a [ProjectFileView],
-) -> (Option<&'a ProjectFileView>, Vec<Iteration>, Vec<&'a ProjectFileView>) {
-    let seed = project
-        .seed_filename
-        .as_deref()
-        .and_then(|seed_name| files.iter().find(|f| f.source == FileSource::Home && f.file_name == seed_name));
+struct ImageGroup {
+    image: ProjectFileView,
+    iterations: Vec<Iteration>,
+}
+
+fn file_stem(file_name: &str) -> String {
+    Path::new(file_name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_name.to_string())
+}
+
+fn group_files(
+    files: &[ProjectFileView],
+    ext: &ExtensionRules,
+) -> (Vec<ImageGroup>, Vec<Iteration>, Vec<ProjectFileView>) {
+    let mut images: Vec<ProjectFileView> = files
+        .iter()
+        .filter(|f| f.source == FileSource::Home && f.base_name.is_some())
+        .cloned()
+        .collect();
+    images.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+
+    let image_names: BTreeSet<String> = images.iter().map(|f| f.file_name.clone()).collect();
 
     let mut groups: BTreeMap<String, Iteration> = BTreeMap::new();
     let mut leftovers = Vec::new();
 
     for f in files {
-        if Some(f) == seed {
+        if image_names.contains(&f.file_name) {
             continue;
         }
-        match f.ext.as_str() {
-            "prt" | "bmp" => {
-                let stem = Path::new(&f.file_name)
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| f.file_name.clone());
-                let entry = groups.entry(stem.clone()).or_insert_with(|| Iteration {
-                    label: stem,
-                    prt: None,
-                    bmp: None,
-                });
-                if f.ext == "prt" {
-                    entry.prt = Some(f.clone());
-                } else {
-                    entry.bmp = Some(f.clone());
-                }
-            }
-            _ => leftovers.push(f),
+        if ext.is_child(&f.ext) {
+            let stem = file_stem(&f.file_name);
+            let entry = groups.entry(stem.clone()).or_insert_with(|| Iteration { label: stem, files: Vec::new() });
+            entry.files.push(f.clone());
+        } else {
+            leftovers.push(f.clone());
+        }
+    }
+    for iteration in groups.values_mut() {
+        iteration.files.sort_by(|a, b| a.ext.cmp(&b.ext));
+    }
+
+    let mut image_groups: Vec<ImageGroup> = images
+        .into_iter()
+        .map(|image| ImageGroup { image, iterations: Vec::new() })
+        .collect();
+
+    let mut unassigned = Vec::new();
+    for (stem, iteration) in groups {
+        let base = base_name_of(&stem);
+        match image_groups.iter_mut().find(|g| g.image.base_name.as_deref() == Some(base.as_str())) {
+            Some(group) => group.iterations.push(iteration),
+            None => unassigned.push(iteration),
         }
     }
 
-    (seed, groups.into_values().collect(), leftovers)
+    (image_groups, unassigned, leftovers)
 }
 
 struct SetupDialog {
     root: Option<PathBuf>,
-    rip: Option<PathBuf>,
+    relevant_dirs: Vec<PathBuf>,
+    parent_extensions: String,
+    child_extensions: String,
+}
+
+fn setup_dialog_from_settings(settings: &Settings) -> SetupDialog {
+    SetupDialog {
+        root: settings.root_directory.clone(),
+        relevant_dirs: settings.relevant_directories.clone(),
+        parent_extensions: settings.extension_rules.parent_extensions.join(", "),
+        child_extensions: settings.extension_rules.child_extensions.join(", "),
+    }
+}
+
+fn parse_ext_list(s: &str) -> Vec<String> {
+    s.split(',').map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase()).filter(|e| !e.is_empty()).collect()
 }
 
 struct ScratchDialog {
@@ -77,12 +113,86 @@ pub struct App {
     scratch_dialog: Option<ScratchDialog>,
 
     thumbnails: HashMap<PathBuf, egui::TextureHandle>,
+    pending_thumbnails: HashSet<PathBuf>,
+    thumbnail_request_tx: Sender<ThumbnailRequest>,
+    thumbnail_result_rx: Receiver<(PathBuf, Option<egui::TextureHandle>)>,
 
     status: Option<String>,
 }
 
+const THUMBNAIL_MAX_DIM: u32 = 160;
+
+struct ThumbnailRequest {
+    path: PathBuf,
+    modified_unix: i64,
+    size_bytes: u64,
+}
+
+fn spawn_thumbnail_loader(
+    ctx: egui::Context,
+    cache_dir: Option<PathBuf>,
+) -> (Sender<ThumbnailRequest>, Receiver<(PathBuf, Option<egui::TextureHandle>)>) {
+    let (request_tx, request_rx) = crossbeam_channel::unbounded::<ThumbnailRequest>();
+    let (result_tx, result_rx) = crossbeam_channel::unbounded::<(PathBuf, Option<egui::TextureHandle>)>();
+
+    let worker_count = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 4);
+    for _ in 0..worker_count {
+        let request_rx = request_rx.clone();
+        let result_tx = result_tx.clone();
+        let ctx = ctx.clone();
+        let cache_dir = cache_dir.clone();
+        std::thread::spawn(move || {
+            while let Ok(req) = request_rx.recv() {
+                let tex = load_thumbnail_rgba(&req, cache_dir.as_deref()).map(|rgba| {
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                    ctx.load_texture(req.path.to_string_lossy(), color_image, egui::TextureOptions::LINEAR)
+                });
+                if result_tx.send((req.path, tex)).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    (request_tx, result_rx)
+}
+
+fn thumbnail_cache_path(cache_dir: &Path, req: &ThumbnailRequest) -> PathBuf {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    req.path.hash(&mut hasher);
+    let path_hash = hasher.finish();
+    cache_dir.join(format!("{path_hash:016x}_{}_{}.png", req.modified_unix, req.size_bytes))
+}
+
+fn load_thumbnail_rgba(req: &ThumbnailRequest, cache_dir: Option<&Path>) -> Option<image::RgbaImage> {
+    let cache_path = cache_dir.map(|dir| thumbnail_cache_path(dir, req));
+
+    if let Some(cache_path) = &cache_path {
+        if let Ok(cached) = image::open(cache_path) {
+            return Some(cached.into_rgba8());
+        }
+    }
+
+    let decoded = image::open(&req.path).ok()?.thumbnail(THUMBNAIL_MAX_DIM, THUMBNAIL_MAX_DIM).into_rgba8();
+
+    if let Some(cache_path) = &cache_path {
+        if let Some(dir) = cache_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = decoded.save(cache_path);
+    }
+
+    Some(decoded)
+}
+
 impl App {
-    pub fn new(command_tx: Sender<Command>, ui_event_rx: Receiver<UiEvent>) -> Self {
+    pub fn new(command_tx: Sender<Command>, ui_event_rx: Receiver<UiEvent>, ctx: egui::Context) -> Self {
+        let cache_dir = crate::db::thumbnail_cache_dir().ok();
+        let (thumbnail_request_tx, thumbnail_result_rx) = spawn_thumbnail_loader(ctx, cache_dir);
         Self {
             command_tx,
             ui_event_rx,
@@ -94,6 +204,9 @@ impl App {
             new_project_menu_open: false,
             scratch_dialog: None,
             thumbnails: HashMap::new(),
+            pending_thumbnails: HashSet::new(),
+            thumbnail_request_tx,
+            thumbnail_result_rx,
             status: None,
         }
     }
@@ -102,16 +215,28 @@ impl App {
         let _ = self.command_tx.send(cmd);
     }
 
-    fn thumbnail_texture(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
+    fn thumbnail_texture(&mut self, file: &ProjectFileView) -> Option<egui::TextureHandle> {
+        let path = &file.abs_path;
         if let Some(tex) = self.thumbnails.get(path) {
             return Some(tex.clone());
         }
-        let decoded = image::open(path).ok()?.into_rgba8();
-        let size = [decoded.width() as usize, decoded.height() as usize];
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
-        let tex = ctx.load_texture(path.to_string_lossy(), color_image, egui::TextureOptions::LINEAR);
-        self.thumbnails.insert(path.to_path_buf(), tex.clone());
-        Some(tex)
+        if self.pending_thumbnails.insert(path.clone()) {
+            let _ = self.thumbnail_request_tx.send(ThumbnailRequest {
+                path: path.clone(),
+                modified_unix: file.modified_at.timestamp(),
+                size_bytes: file.size_bytes,
+            });
+        }
+        None
+    }
+
+    fn drain_thumbnail_results(&mut self) {
+        while let Ok((path, tex)) = self.thumbnail_result_rx.try_recv() {
+            self.pending_thumbnails.remove(&path);
+            if let Some(tex) = tex {
+                self.thumbnails.insert(path, tex);
+            }
+        }
     }
 
     fn show_file_row(&mut self, ui: &mut egui::Ui, file: &ProjectFileView) {
@@ -145,6 +270,26 @@ impl App {
         });
     }
 
+    fn show_iteration(&mut self, ui: &mut egui::Ui, iteration: &Iteration) {
+        let thumb_file = iteration.files.iter().find(|f| self.settings.extension_rules.is_parent(&f.ext)).cloned();
+        let tex = thumb_file.as_ref().and_then(|f| self.thumbnail_texture(f));
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                if let Some(tex) = &tex {
+                    ui.add(egui::Image::new(tex).max_size(egui::vec2(96.0, 96.0)));
+                } else {
+                    ui.weak("(no thumbnail yet)");
+                }
+                ui.vertical(|ui| {
+                    ui.label(&iteration.label);
+                    for file in &iteration.files {
+                        self.show_file_row(ui, file);
+                    }
+                });
+            });
+        });
+    }
+
     fn drain_events(&mut self) {
         while let Ok(event) = self.ui_event_rx.try_recv() {
             match event {
@@ -152,10 +297,7 @@ impl App {
                     if settings.is_configured() {
                         self.setup_dialog = None;
                     } else if self.setup_dialog.is_none() {
-                        self.setup_dialog = Some(SetupDialog {
-                            root: settings.root_directory.clone(),
-                            rip: settings.rip_directory.clone(),
-                        });
+                        self.setup_dialog = Some(setup_dialog_from_settings(&settings));
                     }
                     self.settings = settings;
                 }
@@ -178,12 +320,18 @@ impl App {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for file in dropped {
             let Some(path) = file.path else { continue };
-            if is_image_path(&path) {
+            if self.is_source_path(&path) {
                 self.send(Command::CreateProjectFromImage { image_path: path });
             } else {
                 self.status = Some(format!("Dropped file isn't a recognized image: {}", path.display()));
             }
         }
+    }
+
+    fn is_source_path(&self, path: &Path) -> bool {
+        path.extension()
+            .map(|e| self.settings.extension_rules.is_parent(&e.to_string_lossy().to_ascii_lowercase()))
+            .unwrap_or(false)
     }
 
     fn show_status_bar(&mut self, ui: &mut egui::Ui) {
@@ -223,22 +371,19 @@ impl App {
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     if ui.button("⚙ Directories...").clicked() {
-                        self.setup_dialog = Some(SetupDialog {
-                            root: self.settings.root_directory.clone(),
-                            rip: self.settings.rip_directory.clone(),
-                        });
+                        self.setup_dialog = Some(setup_dialog_from_settings(&self.settings));
                     }
                     if ui
                         .button("⟳ Sync now")
                         .on_hover_text(
-                            "Manually re-check the root and RIP directories. \
+                            "Manually re-check the root and relevant directories. \
                              Changes are picked up live, so this is only needed \
                              as a fallback.",
                         )
                         .clicked()
                     {
                         self.send(Command::SyncRootDirectory);
-                        self.send(Command::RescanRipDirectory);
+                        self.send(Command::SyncRelevantDirectories);
                     }
                 });
             });
@@ -256,8 +401,10 @@ impl App {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
+                let parent_exts: Vec<&str> =
+                    self.settings.extension_rules.parent_extensions.iter().map(String::as_str).collect();
                 if ui.button("📥 Select image from Downloads...").clicked() {
-                    let mut dialog = rfd::FileDialog::new().add_filter("Image", IMAGE_EXTENSIONS);
+                    let mut dialog = rfd::FileDialog::new().add_filter("Image", &parent_exts);
                     if let Some(dir) = downloads_dir() {
                         dialog = dialog.set_directory(dir);
                     }
@@ -267,7 +414,7 @@ impl App {
                     close = true;
                 }
                 if ui.button("🖼 Browse for image...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().add_filter("Image", IMAGE_EXTENSIONS).pick_file() {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("Image", &parent_exts).pick_file() {
                         self.send(Command::CreateProjectFromImage { image_path: path });
                     }
                     close = true;
@@ -328,8 +475,9 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.label(
-                    "Choose where project folders are created, and where PrintFactory RIP \
-                     writes its output (.prt / .bmp).",
+                    "Choose where project folders are created, and which folder(s) hold \
+                     output from external tools (like PrintFactory RIP) that should be \
+                     matched into projects by filename.",
                 );
                 ui.add_space(8.0);
 
@@ -341,25 +489,57 @@ impl App {
                     }
                     ui.weak(display_or(&dialog.root, "Not set"));
                 });
-                ui.horizontal(|ui| {
-                    if ui.button("Choose RIP directory...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            dialog.rip = Some(path);
-                        }
-                    }
-                    ui.weak(display_or(&dialog.rip, "Not set"));
-                });
 
                 ui.add_space(8.0);
-                let ready = dialog.root.is_some() && dialog.rip.is_some();
+                ui.label("Relevant directories (e.g. RIP output folders):");
+                let mut remove_at = None;
+                for (i, dir) in dialog.relevant_dirs.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Remove").clicked() {
+                            remove_at = Some(i);
+                        }
+                        ui.label(dir.display().to_string());
+                    });
+                }
+                if let Some(i) = remove_at {
+                    dialog.relevant_dirs.remove(i);
+                }
+                if ui.button("+ Add folder...").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        if !dialog.relevant_dirs.contains(&path) {
+                            dialog.relevant_dirs.push(path);
+                        }
+                    }
+                }
+
+                ui.add_space(8.0);
+                ui.label("Source (\"parent\") file extensions, comma-separated:");
+                ui.text_edit_singleline(&mut dialog.parent_extensions);
+                ui.label("Iteration (\"child\") output extensions, comma-separated:");
+                ui.text_edit_singleline(&mut dialog.child_extensions);
+                ui.weak(
+                    "An extension in both lists (like the default bmp) is treated as a source \
+                     file unless a sibling with a child-only extension (like prt) shares its name.",
+                );
+
+                ui.add_space(8.0);
+                let ready = dialog.root.is_some() && !dialog.relevant_dirs.is_empty();
                 if ui.add_enabled(ready, egui::Button::new("Continue")).clicked() {
                     submit = true;
                 }
             });
 
         if submit {
-            if let (Some(root), Some(rip)) = (dialog.root.clone(), dialog.rip.clone()) {
-                self.send(Command::SetDirectories { root_directory: root, rip_directory: rip });
+            if let Some(root) = dialog.root.clone() {
+                let relevant_directories = dialog.relevant_dirs.clone();
+                let parent_extensions = parse_ext_list(&dialog.parent_extensions);
+                let child_extensions = parse_ext_list(&dialog.child_extensions);
+                self.send(Command::SaveSettings {
+                    root_directory: root,
+                    relevant_directories,
+                    parent_extensions,
+                    child_extensions,
+                });
             }
         }
     }
@@ -382,8 +562,8 @@ impl App {
                 if ui.button("Rescan").clicked() {
                     self.send(Command::RescanProject { project_id });
                 }
-                if ui.button("Sync RIP directory").clicked() {
-                    self.send(Command::RescanRipDirectory);
+                if ui.button("Sync relevant directories").clicked() {
+                    self.send(Command::SyncRelevantDirectories);
                 }
             });
             ui.weak(format!("Folder: {}", project.folder_path.display()));
@@ -403,54 +583,51 @@ impl App {
                 return;
             }
 
-            let (seed, iterations, leftovers) = group_files(&project, &files);
-            let seed = seed.cloned();
+            let (image_groups, unassigned_iterations, leftovers) = group_files(&files, &self.settings.extension_rules);
 
-            if let Some(seed) = &seed {
-                let tex = self.thumbnail_texture(ui.ctx(), &seed.abs_path);
+            if image_groups.is_empty() {
+                ui.weak("No images in this project yet.");
+                ui.add_space(8.0);
+            }
+
+            for group in &image_groups {
+                let tex = self.thumbnail_texture(&group.image);
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         if let Some(tex) = &tex {
                             ui.add(egui::Image::new(tex).max_size(egui::vec2(128.0, 128.0)));
+                        } else {
+                            ui.weak("(loading...)");
                         }
                         ui.vertical(|ui| {
-                            ui.strong(&seed.file_name);
-                            ui.weak("original image");
-                            ui.weak(seed.modified_at.format("%Y-%m-%d").to_string());
+                            ui.strong(&group.image.file_name);
+                            ui.weak(group.image.modified_at.format("%Y-%m-%d").to_string());
                             if ui.small_button("Open").clicked() {
-                                if let Err(e) = open::that(&seed.abs_path) {
-                                    self.status = Some(format!("Couldn't open {}: {e}", seed.file_name));
+                                if let Err(e) = open::that(&group.image.abs_path) {
+                                    self.status = Some(format!("Couldn't open {}: {e}", group.image.file_name));
                                 }
                             }
                         });
                     });
+
+                    if !group.iterations.is_empty() {
+                        ui.add_space(4.0);
+                        ui.indent((group.image.abs_path.clone(), "iterations"), |ui| {
+                            ui.label(format!("RIP iterations ({})", group.iterations.len()));
+                            for iteration in &group.iterations {
+                                self.show_iteration(ui, iteration);
+                            }
+                        });
+                    }
                 });
                 ui.add_space(8.0);
             }
 
-            if !iterations.is_empty() {
-                ui.label(format!("RIP iterations ({})", iterations.len()));
-                egui::ScrollArea::vertical().id_salt("iterations").max_height(400.0).show(ui, |ui| {
-                    for iteration in &iterations {
-                        let bmp_tex = iteration.bmp.as_ref().and_then(|bmp| self.thumbnail_texture(ui.ctx(), &bmp.abs_path));
-                        ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                if let Some(tex) = &bmp_tex {
-                                    ui.add(egui::Image::new(tex).max_size(egui::vec2(96.0, 96.0)));
-                                } else {
-                                    ui.weak("(no thumbnail yet)");
-                                }
-                                ui.vertical(|ui| {
-                                    ui.label(&iteration.label);
-                                    if let Some(prt) = &iteration.prt {
-                                        self.show_file_row(ui, prt);
-                                    }
-                                    if let Some(bmp) = &iteration.bmp {
-                                        self.show_file_row(ui, bmp);
-                                    }
-                                });
-                            });
-                        });
+            if !unassigned_iterations.is_empty() {
+                ui.label(format!("Unmatched RIP iterations ({})", unassigned_iterations.len()));
+                egui::ScrollArea::vertical().id_salt("unassigned_iterations").max_height(400.0).show(ui, |ui| {
+                    for iteration in &unassigned_iterations {
+                        self.show_iteration(ui, iteration);
                     }
                 });
                 ui.add_space(8.0);
@@ -459,7 +636,7 @@ impl App {
             if !leftovers.is_empty() {
                 ui.label(format!("Other files ({})", leftovers.len()));
                 egui::ScrollArea::vertical().id_salt("leftovers").show(ui, |ui| {
-                    for file in leftovers {
+                    for file in &leftovers {
                         self.show_file_row(ui, file);
                     }
                 });
@@ -471,6 +648,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.drain_thumbnail_results();
         let ctx = ui.ctx().clone();
         self.handle_dropped_files(&ctx);
 
@@ -491,12 +669,6 @@ fn reveal_in_explorer(path: &Path) -> std::io::Result<()> {
         .arg(format!("/select,{}", path.display()))
         .spawn()
         .map(|_| ())
-}
-
-fn is_image_path(path: &Path) -> bool {
-    path.extension()
-        .map(|e| IMAGE_EXTENSIONS.contains(&e.to_string_lossy().to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
 }
 
 fn downloads_dir() -> Option<PathBuf> {

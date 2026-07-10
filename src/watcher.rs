@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crossbeam_channel::Sender;
@@ -12,7 +12,7 @@ const DEBOUNCE: Duration = Duration::from_millis(400);
 #[derive(Default)]
 pub struct Watchers {
     root: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
-    rip: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
+    relevant: Vec<Debouncer<RecommendedWatcher, RecommendedCache>>,
 }
 
 impl Watchers {
@@ -26,10 +26,16 @@ impl Watchers {
         });
     }
 
-    pub fn watch_rip(&mut self, path: &Path, tx: Sender<WatchEvent>) {
-        self.rip = build(path, move || {
-            let _ = tx.send(WatchEvent::RipChanged);
-        });
+    pub fn watch_relevant_directories(&mut self, paths: &[PathBuf], tx: Sender<WatchEvent>) {
+        self.relevant = paths
+            .iter()
+            .filter_map(|path| {
+                let tx = tx.clone();
+                build(path, move || {
+                    let _ = tx.send(WatchEvent::RelevantChanged);
+                })
+            })
+            .collect();
     }
 }
 

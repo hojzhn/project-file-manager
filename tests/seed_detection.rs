@@ -2,6 +2,7 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use matr_project_file_manager::db::{queries, Db};
+use matr_project_file_manager::model::ExtensionRules;
 use matr_project_file_manager::scanner;
 
 fn tempdir(label: &str) -> std::path::PathBuf {
@@ -25,7 +26,7 @@ fn adoption_prefers_real_photo_over_paired_rip_thumbnail() {
     fs::write(folder.join("IMG_4672 copy-0.prt"), "job").unwrap();
     fs::write(folder.join("IMG_4672 copy-0.bmp"), "thumb").unwrap();
 
-    scanner::sync_root_directory(&mut db.conn, &root).unwrap();
+    scanner::sync_root_directory(&mut db.conn, &root, &ExtensionRules::default()).unwrap();
 
     let project = queries::list_projects(&db.conn).unwrap().into_iter().next().unwrap();
     assert_eq!(project.seed_filename.as_deref(), Some("IMG_4672 copy.jpg"));
@@ -47,7 +48,7 @@ fn already_broken_seed_self_heals_on_next_sync() {
     let project = queries::create_project(&db.conn, "mug", &folder, Some("mug-0.bmp"), Some("mug")).unwrap();
     assert_eq!(project.seed_filename.as_deref(), Some("mug-0.bmp"));
 
-    scanner::sync_root_directory(&mut db.conn, &root).unwrap();
+    scanner::sync_root_directory(&mut db.conn, &root, &ExtensionRules::default()).unwrap();
 
     let healed = queries::get_project(&db.conn, project.id).unwrap().unwrap();
     assert_eq!(healed.seed_filename.as_deref(), Some("mug.jpg"), "self-healed to the real photo");

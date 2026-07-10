@@ -12,7 +12,7 @@ fn main() -> eframe::Result<()> {
         eframe::NativeOptions::default(),
         Box::new(move |cc| {
             worker::spawn(command_rx, watch_tx, watch_rx, ui_event_tx, cc.egui_ctx.clone());
-            Ok(Box::new(app::App::new(command_tx, ui_event_rx)))
+            Ok(Box::new(app::App::new(command_tx, ui_event_rx, cc.egui_ctx.clone())))
         }),
     )
 }

@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 use crate::db::queries::{self, ScannedFile, ScannedRipFile};
 use crate::error::AppResult;
-use crate::model::{Project, IMAGE_EXTENSIONS, RIP_EXTENSIONS};
+use crate::model::{ExtensionRules, Project};
 
 fn system_time_to_utc(t: std::io::Result<std::time::SystemTime>) -> DateTime<Utc> {
     t.ok().map(DateTime::<Utc>::from).unwrap_or_else(Utc::now)
@@ -23,7 +23,7 @@ pub fn base_name_of(file_stem: &str) -> String {
     lower
 }
 
-pub fn scan_project_home(conn: &mut Connection, project: &Project) -> AppResult<usize> {
+pub fn scan_project_home(conn: &mut Connection, project: &Project, ext: &ExtensionRules) -> AppResult<usize> {
     let root = &project.folder_path;
     let mut scanned = Vec::new();
 
@@ -48,7 +48,7 @@ pub fn scan_project_home(conn: &mut Connection, project: &Project) -> AppResult<
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let ext = path
+        let file_ext = path
             .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase())
             .unwrap_or_default();
@@ -57,11 +57,21 @@ pub fn scan_project_home(conn: &mut Connection, project: &Project) -> AppResult<
             abs_path: path.to_path_buf(),
             relative_path,
             file_name,
-            ext,
+            ext: file_ext,
             size_bytes: metadata.len(),
             created_at: system_time_to_utc(metadata.created()),
             modified_at: system_time_to_utc(metadata.modified()),
+            base_name: None,
         });
+    }
+
+    let child_only_stems: HashSet<String> = scanned
+        .iter()
+        .filter(|f| ext.is_child_only(&f.ext))
+        .map(|f| file_stem_lower(&f.file_name))
+        .collect();
+    for f in &mut scanned {
+        f.base_name = parent_base_name(&f.file_name, &f.ext, ext, &child_only_stems);
     }
 
     let count = scanned.len();
@@ -69,10 +79,43 @@ pub fn scan_project_home(conn: &mut Connection, project: &Project) -> AppResult<
     Ok(count)
 }
 
-pub fn scan_rip_directory(conn: &mut Connection, rip_dir: &Path) -> AppResult<usize> {
-    let mut scanned = Vec::new();
+fn file_stem_lower(file_name: &str) -> String {
+    Path::new(file_name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
+}
 
-    for entry in walkdir::WalkDir::new(rip_dir)
+fn parent_base_name(
+    file_name: &str,
+    file_ext: &str,
+    ext: &ExtensionRules,
+    child_only_stems: &HashSet<String>,
+) -> Option<String> {
+    if !ext.is_parent(file_ext) {
+        return None;
+    }
+    let stem_lower = file_stem_lower(file_name);
+    if ext.is_child(file_ext) && child_only_stems.contains(&stem_lower) {
+        return None;
+    }
+    Some(base_name_of(&stem_lower))
+}
+
+pub fn scan_relevant_directories(conn: &mut Connection, dirs: &[PathBuf], ext: &ExtensionRules) -> AppResult<usize> {
+    let mut scanned = Vec::new();
+    for dir in dirs {
+        collect_relevant_files(dir, ext, &mut scanned);
+    }
+
+    let count = scanned.len();
+    queries::reconcile_rip_files(conn, &scanned)?;
+    queries::rematch_rip_files(conn)?;
+    Ok(count)
+}
+
+fn collect_relevant_files(dir: &Path, ext: &ExtensionRules, scanned: &mut Vec<ScannedRipFile>) {
+    for entry in walkdir::WalkDir::new(dir)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -81,11 +124,11 @@ pub fn scan_rip_directory(conn: &mut Connection, rip_dir: &Path) -> AppResult<us
             continue;
         }
         let path = entry.path();
-        let ext = path
+        let file_ext = path
             .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase())
             .unwrap_or_default();
-        if !RIP_EXTENSIONS.contains(&ext.as_str()) {
+        if !ext.is_child(&file_ext) {
             continue;
         }
         let Ok(metadata) = entry.metadata() else {
@@ -104,20 +147,15 @@ pub fn scan_rip_directory(conn: &mut Connection, rip_dir: &Path) -> AppResult<us
             abs_path: path.to_path_buf(),
             file_name,
             base_name: base_name_of(&stem),
-            ext,
+            ext: file_ext,
             size_bytes: metadata.len(),
             created_at: system_time_to_utc(metadata.created()),
             modified_at: system_time_to_utc(metadata.modified()),
         });
     }
-
-    let count = scanned.len();
-    queries::reconcile_rip_files(conn, &scanned)?;
-    queries::rematch_rip_files(conn)?;
-    Ok(count)
 }
 
-pub fn sync_root_directory(conn: &mut Connection, root: &Path) -> AppResult<usize> {
+pub fn sync_root_directory(conn: &mut Connection, root: &Path, ext: &ExtensionRules) -> AppResult<usize> {
     let known: HashSet<PathBuf> = queries::list_projects(conn)?.into_iter().map(|p| p.folder_path).collect();
 
     let mut discovered = 0;
@@ -127,7 +165,7 @@ pub fn sync_root_directory(conn: &mut Connection, root: &Path) -> AppResult<usiz
             if !path.is_dir() || known.contains(&path) {
                 continue;
             }
-            adopt_folder_as_project(conn, &path)?;
+            adopt_folder_as_project(conn, &path, ext)?;
             discovered += 1;
         }
     }
@@ -137,8 +175,8 @@ pub fn sync_root_directory(conn: &mut Connection, root: &Path) -> AppResult<usiz
             queries::archive_project(conn, project.id)?;
             continue;
         }
-        heal_misdetected_seed(conn, &project)?;
-        scan_project_home(conn, &project)?;
+        heal_misdetected_seed(conn, &project, ext)?;
+        scan_project_home(conn, &project, ext)?;
     }
     if discovered > 0 {
         queries::rematch_rip_files(conn)?;
@@ -147,30 +185,30 @@ pub fn sync_root_directory(conn: &mut Connection, root: &Path) -> AppResult<usiz
     Ok(discovered)
 }
 
-fn adopt_folder_as_project(conn: &mut Connection, folder_path: &Path) -> AppResult<()> {
+fn adopt_folder_as_project(conn: &mut Connection, folder_path: &Path, ext: &ExtensionRules) -> AppResult<()> {
     let name = folder_path
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "untitled".to_string());
 
     let entries = top_level_files(folder_path);
-    let (seed_filename, seed_basename) = seed_from_entries(&entries);
+    let (seed_filename, seed_basename) = seed_from_entries(&entries, ext);
 
     queries::create_project(conn, &name, folder_path, seed_filename.as_deref(), seed_basename.as_deref())?;
     Ok(())
 }
 
-fn heal_misdetected_seed(conn: &Connection, project: &Project) -> AppResult<()> {
+fn heal_misdetected_seed(conn: &Connection, project: &Project, ext: &ExtensionRules) -> AppResult<()> {
     let Some(seed_name) = &project.seed_filename else {
         return Ok(());
     };
     let entries = top_level_files(&project.folder_path);
     let seed_path = project.folder_path.join(seed_name);
-    if !is_rip_thumbnail_bmp(&seed_path, &entries) {
+    if !is_child_masquerading_as_parent(&seed_path, &entries, ext) {
         return Ok(());
     }
 
-    let (seed_filename, seed_basename) = seed_from_entries(&entries);
+    let (seed_filename, seed_basename) = seed_from_entries(&entries, ext);
     queries::update_project_seed(conn, project.id, seed_filename.as_deref(), seed_basename.as_deref())?;
     Ok(())
 }
@@ -185,13 +223,13 @@ fn top_level_files(folder_path: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn seed_from_entries(entries: &[PathBuf]) -> (Option<String>, Option<String>) {
+fn seed_from_entries(entries: &[PathBuf], ext: &ExtensionRules) -> (Option<String>, Option<String>) {
     let best = entries
         .iter()
-        .filter(|p| is_image_extension(p) && !is_rip_thumbnail_bmp(p, entries))
+        .filter(|p| is_parent_ext_path(p, ext) && !is_child_masquerading_as_parent(p, entries, ext))
         .min_by_key(|p| {
-            let is_bmp = p.extension().map(|e| e.eq_ignore_ascii_case("bmp")).unwrap_or(false);
-            u8::from(is_bmp)
+            let ambiguous = path_ext(p).map(|e| ext.is_child(&e)).unwrap_or(false);
+            u8::from(ambiguous)
         });
 
     match best {
@@ -204,18 +242,21 @@ fn seed_from_entries(entries: &[PathBuf]) -> (Option<String>, Option<String>) {
     }
 }
 
-fn is_rip_thumbnail_bmp(path: &Path, siblings: &[PathBuf]) -> bool {
-    if !path.extension().map(|e| e.eq_ignore_ascii_case("bmp")).unwrap_or(false) {
+fn path_ext(path: &Path) -> Option<String> {
+    path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase())
+}
+
+fn is_child_masquerading_as_parent(path: &Path, siblings: &[PathBuf], ext: &ExtensionRules) -> bool {
+    let Some(this_ext) = path_ext(path) else { return false };
+    if !(ext.is_parent(&this_ext) && ext.is_child(&this_ext)) {
         return false;
     }
     let stem = path.file_stem();
-    siblings
-        .iter()
-        .any(|s| s.file_stem() == stem && s.extension().map(|e| e.eq_ignore_ascii_case("prt")).unwrap_or(false))
+    siblings.iter().any(|s| {
+        s.file_stem() == stem && path_ext(s).map(|e| ext.is_child_only(&e)).unwrap_or(false)
+    })
 }
 
-fn is_image_extension(path: &Path) -> bool {
-    path.extension()
-        .map(|e| IMAGE_EXTENSIONS.contains(&e.to_string_lossy().to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+fn is_parent_ext_path(path: &Path, ext: &ExtensionRules) -> bool {
+    path_ext(path).map(|e| ext.is_parent(&e)).unwrap_or(false)
 }

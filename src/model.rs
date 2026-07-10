@@ -11,15 +11,48 @@ pub struct HomeFileId(pub i64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RipFileId(pub i64);
 
+pub const DEFAULT_PARENT_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp"];
+pub const DEFAULT_CHILD_EXTENSIONS: &[&str] = &["prt", "bmp"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionRules {
+    pub parent_extensions: Vec<String>,
+    pub child_extensions: Vec<String>,
+}
+
+impl Default for ExtensionRules {
+    fn default() -> Self {
+        Self {
+            parent_extensions: DEFAULT_PARENT_EXTENSIONS.iter().map(|s| s.to_string()).collect(),
+            child_extensions: DEFAULT_CHILD_EXTENSIONS.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+}
+
+impl ExtensionRules {
+    pub fn is_parent(&self, ext: &str) -> bool {
+        self.parent_extensions.iter().any(|e| e.eq_ignore_ascii_case(ext))
+    }
+
+    pub fn is_child(&self, ext: &str) -> bool {
+        self.child_extensions.iter().any(|e| e.eq_ignore_ascii_case(ext))
+    }
+
+    pub fn is_child_only(&self, ext: &str) -> bool {
+        self.is_child(ext) && !self.is_parent(ext)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
     pub root_directory: Option<PathBuf>,
-    pub rip_directory: Option<PathBuf>,
+    pub relevant_directories: Vec<PathBuf>,
+    pub extension_rules: ExtensionRules,
 }
 
 impl Settings {
     pub fn is_configured(&self) -> bool {
-        self.root_directory.is_some() && self.rip_directory.is_some()
+        self.root_directory.is_some() && !self.relevant_directories.is_empty()
     }
 }
 
@@ -46,6 +79,7 @@ pub struct HomeFile {
     pub created_at: DateTime<Utc>,
     pub modified_at: DateTime<Utc>,
     pub missing: bool,
+    pub base_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +112,7 @@ pub struct ProjectFileView {
     pub size_bytes: u64,
     pub created_at: DateTime<Utc>,
     pub modified_at: DateTime<Utc>,
+    pub base_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +139,3 @@ impl FileKind {
         matches!(self, FileKind::Image)
     }
 }
-
-pub const IMAGE_EXTENSIONS: &[&str] = &["bmp", "png", "jpg", "jpeg"];
-
-pub const RIP_EXTENSIONS: &[&str] = &["prt", "bmp"];
