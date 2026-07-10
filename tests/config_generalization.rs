@@ -1,4 +1,4 @@
-use std::fs;
+﻿use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use matr_project_file_manager::db::{queries, Db};
@@ -41,8 +41,8 @@ fn settings_round_trip_relevant_directories_and_extension_rules() {
 #[test]
 fn multiple_relevant_directories_are_all_scanned_and_matched() {
     let root = tempdir("multi_dir_root");
-    let rip_a = tempdir("multi_dir_a");
-    let rip_b = tempdir("multi_dir_b");
+    let relevant_a = tempdir("multi_dir_a");
+    let relevant_b = tempdir("multi_dir_b");
     let db_path = tempdir("multi_dir_db").join("index.sqlite3");
     let mut db = Db::open(&db_path).unwrap();
 
@@ -53,9 +53,9 @@ fn multiple_relevant_directories_are_all_scanned_and_matched() {
         queries::create_project(&db.conn, "photo", &project_folder, Some("photo.jpg"), Some("photo")).unwrap();
     scanner::scan_project_home(&mut db.conn, &project, &ExtensionRules::default()).unwrap();
 
-    fs::write(rip_a.join("photo-0.prt"), "job").unwrap();
-    fs::write(rip_b.join("photo-1.prt"), "job").unwrap();
-    scanner::scan_relevant_directories(&mut db.conn, &[rip_a, rip_b], &ExtensionRules::default()).unwrap();
+    fs::write(relevant_a.join("photo-0.prt"), "job").unwrap();
+    fs::write(relevant_b.join("photo-1.prt"), "job").unwrap();
+    scanner::scan_relevant_directories(&mut db.conn, &[relevant_a, relevant_b], &ExtensionRules::default()).unwrap();
 
     let files = queries::files_for_project(&db.conn, project.id).unwrap();
     assert!(files.iter().any(|f| f.file_name == "photo-0.prt"), "output from the first folder must match");
@@ -65,7 +65,7 @@ fn multiple_relevant_directories_are_all_scanned_and_matched() {
 #[test]
 fn extension_rules_are_configurable_beyond_the_image_prt_bmp_default() {
     let root = tempdir("custom_ext_root");
-    let rip_dir = tempdir("custom_ext_rip");
+    let relevant_dir = tempdir("custom_ext_rip");
     let db_path = tempdir("custom_ext_db").join("index.sqlite3");
     let mut db = Db::open(&db_path).unwrap();
 
@@ -81,9 +81,9 @@ fn extension_rules_are_configurable_beyond_the_image_prt_bmp_default() {
         queries::create_project(&db.conn, "design", &project_folder, Some("design.svg"), Some("design")).unwrap();
     scanner::scan_project_home(&mut db.conn, &project, &rules).unwrap();
 
-    fs::write(rip_dir.join("design-0.gcode"), "toolpath").unwrap();
-    fs::write(rip_dir.join("design-0.jpg"), "not tracked").unwrap();
-    scanner::scan_relevant_directories(&mut db.conn, &[rip_dir], &rules).unwrap();
+    fs::write(relevant_dir.join("design-0.gcode"), "toolpath").unwrap();
+    fs::write(relevant_dir.join("design-0.jpg"), "not tracked").unwrap();
+    scanner::scan_relevant_directories(&mut db.conn, &[relevant_dir], &rules).unwrap();
 
     let files = queries::files_for_project(&db.conn, project.id).unwrap();
     assert!(files.iter().any(|f| f.file_name == "design-0.gcode"), "gcode output must match under custom rules");

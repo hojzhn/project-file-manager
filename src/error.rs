@@ -1,4 +1,4 @@
-#[derive(Debug, thiserror::Error)]
+﻿#[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
@@ -15,10 +15,10 @@ pub enum AppError {
     #[error("project not found: {0:?}")]
     ProjectNotFound(crate::model::ProjectId),
 
-    #[error("RIP file not found: {0:?}")]
-    RipFileNotFound(crate::model::RipFileId),
+    #[error("child file not found: {0:?}")]
+    ChildFileNotFound(crate::model::ChildFileId),
 
-    #[error("root and RIP directories must be configured first")]
+    #[error("root and relevant directories must be configured first")]
     DirectoriesNotConfigured,
 }
 

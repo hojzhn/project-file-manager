@@ -1,20 +1,20 @@
-use std::path::{Path, PathBuf};
+﻿use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
 use crate::db::queries;
 use crate::error::AppResult;
-use crate::model::{Project, RipFile};
+use crate::model::{ChildFile, Project};
 
-pub fn move_rip_file_into_project(
+pub fn move_child_file_into_project(
     conn: &mut Connection,
-    rip_file: &RipFile,
+    child_file: &ChildFile,
     project: &Project,
 ) -> AppResult<PathBuf> {
     std::fs::create_dir_all(&project.folder_path)?;
-    let dest = unique_destination(&project.folder_path, &rip_file.file_name);
-    move_file(&rip_file.abs_path, &dest)?;
-    queries::delete_rip_file(conn, rip_file.id)?;
+    let dest = unique_destination(&project.folder_path, &child_file.file_name);
+    move_file(&child_file.abs_path, &dest)?;
+    queries::delete_child_file(conn, child_file.id)?;
     Ok(dest)
 }
 

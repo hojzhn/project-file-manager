@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+﻿use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 
@@ -9,7 +9,7 @@ pub struct ProjectId(pub i64);
 pub struct HomeFileId(pub i64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RipFileId(pub i64);
+pub struct ChildFileId(pub i64);
 
 pub const DEFAULT_PARENT_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp"];
 pub const DEFAULT_CHILD_EXTENSIONS: &[&str] = &["prt", "bmp"];
@@ -83,8 +83,8 @@ pub struct HomeFile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RipFile {
-    pub id: RipFileId,
+pub struct ChildFile {
+    pub id: ChildFileId,
     pub abs_path: PathBuf,
     pub file_name: String,
     pub base_name: String,
@@ -99,13 +99,13 @@ pub struct RipFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileSource {
     Home,
-    Rip,
+    Child,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectFileView {
     pub source: FileSource,
-    pub rip_file_id: Option<RipFileId>,
+    pub child_file_id: Option<ChildFileId>,
     pub abs_path: PathBuf,
     pub file_name: String,
     pub ext: String,

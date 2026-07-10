@@ -1,12 +1,12 @@
-use std::path::{Path, PathBuf};
+﻿use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    ExtensionRules, FileSource, HomeFile, HomeFileId, Project, ProjectFileView, ProjectId, RipFile,
-    RipFileId, Settings,
+    ChildFile, ChildFileId, ExtensionRules, FileSource, HomeFile, HomeFileId, Project, ProjectFileView,
+    ProjectId, Settings,
 };
 
 fn parse_dt(s: &str) -> DateTime<Utc> {
@@ -145,7 +145,7 @@ pub fn update_project_seed(
 pub fn archive_project(conn: &Connection, project_id: ProjectId) -> AppResult<()> {
     conn.execute("UPDATE projects SET archived = 1 WHERE id = ?1", params![project_id.0])?;
     conn.execute(
-        "UPDATE rip_files SET matched_project_id = NULL WHERE matched_project_id = ?1",
+        "UPDATE child_files SET matched_project_id = NULL WHERE matched_project_id = ?1",
         params![project_id.0],
     )?;
     Ok(())
@@ -240,13 +240,13 @@ pub fn reconcile_home_files(
     Ok(())
 }
 
-fn rip_file_from_row(row: &Row) -> rusqlite::Result<RipFile> {
+fn child_file_from_row(row: &Row) -> rusqlite::Result<ChildFile> {
     let abs_path: String = row.get("abs_path")?;
     let created_at: String = row.get("created_at")?;
     let modified_at: String = row.get("modified_at")?;
     let matched_project_id: Option<i64> = row.get("matched_project_id")?;
-    Ok(RipFile {
-        id: RipFileId(row.get("id")?),
+    Ok(ChildFile {
+        id: ChildFileId(row.get("id")?),
         abs_path: PathBuf::from(abs_path),
         file_name: row.get("file_name")?,
         base_name: row.get("base_name")?,
@@ -259,7 +259,7 @@ fn rip_file_from_row(row: &Row) -> rusqlite::Result<RipFile> {
     })
 }
 
-pub struct ScannedRipFile {
+pub struct ScannedChildFile {
     pub abs_path: PathBuf,
     pub file_name: String,
     pub base_name: String,
@@ -269,13 +269,13 @@ pub struct ScannedRipFile {
     pub modified_at: DateTime<Utc>,
 }
 
-pub fn reconcile_rip_files(conn: &mut Connection, scanned: &[ScannedRipFile]) -> AppResult<()> {
+pub fn reconcile_child_files(conn: &mut Connection, scanned: &[ScannedChildFile]) -> AppResult<()> {
     let tx = conn.transaction()?;
     let now = Utc::now().to_rfc3339();
 
     {
         let mut upsert = tx.prepare(
-            "INSERT INTO rip_files (abs_path, file_name, base_name, ext, size_bytes,
+            "INSERT INTO child_files (abs_path, file_name, base_name, ext, size_bytes,
                                      created_at, modified_at, missing, matched_project_id, last_seen_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8)
              ON CONFLICT(abs_path) DO UPDATE SET
@@ -303,7 +303,7 @@ pub fn reconcile_rip_files(conn: &mut Connection, scanned: &[ScannedRipFile]) ->
     }
 
     tx.execute(
-        "UPDATE rip_files SET missing = 1 WHERE last_seen_at != ?1",
+        "UPDATE child_files SET missing = 1 WHERE last_seen_at != ?1",
         params![now],
     )?;
 
@@ -311,13 +311,13 @@ pub fn reconcile_rip_files(conn: &mut Connection, scanned: &[ScannedRipFile]) ->
     Ok(())
 }
 
-pub fn rematch_rip_files(conn: &Connection) -> AppResult<usize> {
+pub fn rematch_child_files(conn: &Connection) -> AppResult<usize> {
     conn.execute(
-        "UPDATE rip_files
+        "UPDATE child_files
          SET matched_project_id = (
              SELECT hf.project_id FROM home_files hf
              JOIN projects p ON p.id = hf.project_id
-             WHERE hf.base_name = rip_files.base_name AND p.archived = 0 AND hf.missing = 0
+             WHERE hf.base_name = child_files.base_name AND p.archived = 0 AND hf.missing = 0
              ORDER BY hf.created_at DESC
              LIMIT 1
          )
@@ -325,29 +325,29 @@ pub fn rematch_rip_files(conn: &Connection) -> AppResult<usize> {
            AND EXISTS (
              SELECT 1 FROM home_files hf
              JOIN projects p ON p.id = hf.project_id
-             WHERE hf.base_name = rip_files.base_name AND p.archived = 0 AND hf.missing = 0
+             WHERE hf.base_name = child_files.base_name AND p.archived = 0 AND hf.missing = 0
            )",
         [],
     )
     .map_err(AppError::from)
 }
 
-pub fn get_rip_file(conn: &Connection, id: RipFileId) -> AppResult<Option<RipFile>> {
-    conn.query_row("SELECT * FROM rip_files WHERE id = ?1", params![id.0], rip_file_from_row)
+pub fn get_child_file(conn: &Connection, id: ChildFileId) -> AppResult<Option<ChildFile>> {
+    conn.query_row("SELECT * FROM child_files WHERE id = ?1", params![id.0], child_file_from_row)
         .optional()
         .map_err(AppError::from)
 }
 
-pub fn rip_files_matched_to_project(conn: &Connection, project_id: ProjectId) -> AppResult<Vec<RipFile>> {
+pub fn child_files_matched_to_project(conn: &Connection, project_id: ProjectId) -> AppResult<Vec<ChildFile>> {
     let mut stmt = conn.prepare(
-        "SELECT * FROM rip_files WHERE matched_project_id = ?1 AND missing = 0 ORDER BY file_name",
+        "SELECT * FROM child_files WHERE matched_project_id = ?1 AND missing = 0 ORDER BY file_name",
     )?;
-    let rows = stmt.query_map(params![project_id.0], rip_file_from_row)?;
+    let rows = stmt.query_map(params![project_id.0], child_file_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
 }
 
-pub fn delete_rip_file(conn: &Connection, id: RipFileId) -> AppResult<()> {
-    conn.execute("DELETE FROM rip_files WHERE id = ?1", params![id.0])?;
+pub fn delete_child_file(conn: &Connection, id: ChildFileId) -> AppResult<()> {
+    conn.execute("DELETE FROM child_files WHERE id = ?1", params![id.0])?;
     Ok(())
 }
 
@@ -361,7 +361,7 @@ pub fn files_for_project(conn: &Connection, project_id: ProjectId) -> AppResult<
         .into_iter()
         .map(|f| ProjectFileView {
             source: FileSource::Home,
-            rip_file_id: None,
+            child_file_id: None,
             abs_path: f.abs_path,
             file_name: f.file_name,
             ext: f.ext,
@@ -372,10 +372,10 @@ pub fn files_for_project(conn: &Connection, project_id: ProjectId) -> AppResult<
         })
         .collect();
 
-    let rip_files = rip_files_matched_to_project(conn, project_id)?;
-    views.extend(rip_files.into_iter().map(|f| ProjectFileView {
-        source: FileSource::Rip,
-        rip_file_id: Some(f.id),
+    let child_files = child_files_matched_to_project(conn, project_id)?;
+    views.extend(child_files.into_iter().map(|f| ProjectFileView {
+        source: FileSource::Child,
+        child_file_id: Some(f.id),
         abs_path: f.abs_path,
         file_name: f.file_name,
         ext: f.ext,

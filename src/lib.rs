@@ -1,10 +1,11 @@
-pub mod app;
 pub mod commands;
 pub mod db;
 pub mod error;
+pub mod grouping;
 pub mod model;
 pub mod organize;
 pub mod paths;
 pub mod scanner;
+pub mod ui;
 pub mod watcher;
 pub mod worker;

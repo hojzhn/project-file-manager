@@ -1,6 +1,6 @@
-use std::path::PathBuf;
+﻿use std::path::PathBuf;
 
-use crate::model::{Project, ProjectFileView, ProjectId, RipFileId, Settings};
+use crate::model::{ChildFileId, Project, ProjectFileView, ProjectId, Settings};
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -26,8 +26,8 @@ pub enum Command {
     },
     SyncRootDirectory,
     SyncRelevantDirectories,
-    MoveRipFileIntoProject {
-        rip_file_id: RipFileId,
+    MoveChildFileIntoProject {
+        child_file_id: ChildFileId,
     },
     MoveAllMatchedIntoProject {
         project_id: ProjectId,

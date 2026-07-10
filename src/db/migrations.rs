@@ -1,7 +1,7 @@
 use rusqlite_migration::{Migrations, M};
 
 pub fn runner() -> Migrations<'static> {
-    Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2), M::up(SCHEMA_V3)])
+    Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2), M::up(SCHEMA_V3), M::up(SCHEMA_V4)])
 }
 
 const SCHEMA_V1: &str = r#"
@@ -72,4 +72,12 @@ SELECT rip_directory FROM settings WHERE rip_directory IS NOT NULL;
 ALTER TABLE settings ADD COLUMN parent_extensions TEXT NOT NULL DEFAULT 'png,jpg,jpeg,bmp';
 ALTER TABLE settings ADD COLUMN child_extensions TEXT NOT NULL DEFAULT 'prt,bmp';
 ALTER TABLE settings DROP COLUMN rip_directory;
+"#;
+
+const SCHEMA_V4: &str = r#"
+ALTER TABLE rip_files RENAME TO child_files;
+DROP INDEX idx_rip_files_project;
+DROP INDEX idx_rip_files_base_name;
+CREATE INDEX idx_child_files_project ON child_files(matched_project_id, missing);
+CREATE INDEX idx_child_files_base_name ON child_files(base_name);
 "#;

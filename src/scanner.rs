@@ -1,10 +1,10 @@
-use std::collections::HashSet;
+﻿use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 
-use crate::db::queries::{self, ScannedFile, ScannedRipFile};
+use crate::db::queries::{self, ScannedFile, ScannedChildFile};
 use crate::error::AppResult;
 use crate::model::{ExtensionRules, Project};
 
@@ -109,12 +109,12 @@ pub fn scan_relevant_directories(conn: &mut Connection, dirs: &[PathBuf], ext: &
     }
 
     let count = scanned.len();
-    queries::reconcile_rip_files(conn, &scanned)?;
-    queries::rematch_rip_files(conn)?;
+    queries::reconcile_child_files(conn, &scanned)?;
+    queries::rematch_child_files(conn)?;
     Ok(count)
 }
 
-fn collect_relevant_files(dir: &Path, ext: &ExtensionRules, scanned: &mut Vec<ScannedRipFile>) {
+fn collect_relevant_files(dir: &Path, ext: &ExtensionRules, scanned: &mut Vec<ScannedChildFile>) {
     for entry in walkdir::WalkDir::new(dir)
         .follow_links(false)
         .into_iter()
@@ -143,7 +143,7 @@ fn collect_relevant_files(dir: &Path, ext: &ExtensionRules, scanned: &mut Vec<Sc
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        scanned.push(ScannedRipFile {
+        scanned.push(ScannedChildFile {
             abs_path: path.to_path_buf(),
             file_name,
             base_name: base_name_of(&stem),
@@ -179,7 +179,7 @@ pub fn sync_root_directory(conn: &mut Connection, root: &Path, ext: &ExtensionRu
         scan_project_home(conn, &project, ext)?;
     }
     if discovered > 0 {
-        queries::rematch_rip_files(conn)?;
+        queries::rematch_child_files(conn)?;
     }
 
     Ok(discovered)
