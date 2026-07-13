@@ -7,5 +7,6 @@ pub mod organize;
 pub mod paths;
 pub mod scanner;
 pub mod ui;
+pub mod util;
 pub mod watcher;
 pub mod worker;

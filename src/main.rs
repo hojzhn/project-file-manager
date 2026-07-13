@@ -26,5 +26,7 @@ fn main() -> iced::Result {
     )
     .title("Matr Project File Manager")
     .subscription(ui::subscription::subscription)
+    .theme(|_state: &ui::state::State| ui::style::theme())
+    .settings(iced::Settings { default_text_size: ui::style::DEFAULT_TEXT_SIZE.into(), ..Default::default() })
     .run()
 }

@@ -1,8 +1,9 @@
-use iced::widget::{button, column, container, row, text, text_input};
+use iced::widget::{column, row, text};
 use iced::{Element, Length};
 
 use crate::ui::message::Message;
 use crate::ui::state::State;
+use crate::ui::style;
 
 pub fn view(state: &State) -> Element<'static, Message> {
     let Some(dialog) = &state.setup_dialog else {
@@ -15,7 +16,7 @@ pub fn view(state: &State) -> Element<'static, Message> {
     for (index, dir) in dialog.relevant_dirs.iter().enumerate() {
         dirs_col = dirs_col.push(
             row![
-                button("Remove").on_press(Message::SetupRelevantDirRemoved(index)),
+                style::button("Remove", style::ButtonKind::Danger).on_press(Message::SetupRelevantDirRemoved(index)),
                 text(dir.display().to_string()),
             ]
             .spacing(8.0),
@@ -23,37 +24,44 @@ pub fn view(state: &State) -> Element<'static, Message> {
     }
 
     let ready = dialog.root.is_some() && !dialog.relevant_dirs.is_empty();
-    let continue_button =
-        if ready { button("Continue").on_press(Message::SetupSubmitted) } else { button("Continue") };
+    let continue_button = if ready {
+        style::button("Continue", style::ButtonKind::Primary).on_press(Message::SetupSubmitted)
+    } else {
+        style::button("Continue", style::ButtonKind::Primary)
+    };
 
     let content = column![
-        text("Set up directories").size(20),
+        text("Set up directories"),
         text(
             "Choose where project folders are created, and which folder(s) hold output from \
              external tools (like PrintFactory RIP) that should be matched into projects by \
              filename."
         ),
-        row![button("Choose root directory...").on_press(Message::SetupRootPicked), text(root_label)].spacing(8.0),
+        row![
+            style::button("Choose root directory...", style::ButtonKind::Secondary).on_press(Message::SetupRootPicked),
+            text(root_label)
+        ]
+        .spacing(8.0),
         dirs_col,
-        button("+ Add folder...").on_press(Message::SetupRelevantDirAdded),
+        style::button("+ Add folder...", style::ButtonKind::Secondary).on_press(Message::SetupRelevantDirAdded),
         text("Source (\"parent\") file extensions, comma-separated:"),
-        text_input("png, jpg, jpeg, bmp", &dialog.parent_extensions)
+        style::text_input("png, jpg, jpeg, bmp", &dialog.parent_extensions)
             .on_input(Message::SetupParentExtensionsChanged)
             .width(400.0),
         text("Iteration (\"child\") output extensions, comma-separated:"),
-        text_input("prt, bmp", &dialog.child_extensions)
+        style::text_input("prt, bmp", &dialog.child_extensions)
             .on_input(Message::SetupChildExtensionsChanged)
             .width(400.0),
         text(
             "An extension in both lists (like the default bmp) is treated as a source file \
              unless a sibling with a child-only extension (like prt) shares its name."
         )
-        .size(12),
+        ,
         continue_button,
     ]
     .spacing(12.0)
     .padding(24.0)
     .width(520.0);
 
-    container(content).center(Length::Fill).into()
+    style::panel(content).center(Length::Fill).into()
 }

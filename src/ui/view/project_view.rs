@@ -1,27 +1,29 @@
 use std::collections::BTreeSet;
 
 use chrono::NaiveDate;
-use iced::widget::{button, column, container, row, scrollable, text};
+use iced::widget::{column, container, row, text};
 use iced::{Element, Length};
 
 use crate::grouping::group_files;
 use crate::model::{FileSource, ProjectFileView};
 use crate::ui::message::Message;
 use crate::ui::state::State;
+use crate::ui::style;
 use crate::ui::view::widgets::{file_row, image_group_view, iteration_view};
-
+use crate::util::strip_date_prefix;
 pub fn view(state: &State) -> Element<'static, Message> {
     let mut col = column![].spacing(8.0).padding(12.0).width(Length::Fill);
 
     if let Some(status) = &state.status {
         col = col.push(
-            row![text(status.clone()), button("dismiss").on_press(Message::StatusDismissed)].spacing(8.0),
+            row![text(status.clone()), style::button("dismiss", style::ButtonKind::Text).on_press(Message::StatusDismissed)]
+                .spacing(8.0),
         );
     }
 
     let Some(project_id) = state.selected_project else {
         col = col.push(text("Select a project, or create a new one."));
-        col = col.push(text("Tip: drag and drop an image onto this window to start a project from it.").size(12));
+        col = col.push(text("Tip: drag and drop an image onto this window to start a project from it."));
         return container(col).into();
     };
     let Some(project) = state.projects.iter().find(|p| p.id == project_id) else {
@@ -30,18 +32,22 @@ pub fn view(state: &State) -> Element<'static, Message> {
 
     col = col.push(
         row![
-            text(project.name.clone()).size(20),
-            button("Rescan").on_press(Message::RescanProjectClicked),
-            button("Sync relevant directories").on_press(Message::SyncRelevantDirectoriesClicked),
+            text(strip_date_prefix(&project.name).into_owned()),
+            style::button("Rescan", style::ButtonKind::Secondary).on_press(Message::RescanProjectClicked),
+            style::button("Sync relevant directories", style::ButtonKind::Secondary)
+                .on_press(Message::SyncRelevantDirectoriesClicked),
         ]
         .spacing(8.0),
     );
-    col = col.push(text(format!("Folder: {}", project.folder_path.display())).size(12));
+    col = col.push(text(format!("Folder: {}", project.folder_path.display())));
 
     let files = state.files_by_project.get(&project_id).cloned().unwrap_or_default();
     let pending_child_files = files.iter().any(|f| f.source == FileSource::Child);
     if pending_child_files {
-        col = col.push(button("Move all matched files into project").on_press(Message::MoveAllMatchedClicked));
+        col = col.push(
+            style::button("Move all matched files into project", style::ButtonKind::Primary)
+                .on_press(Message::MoveAllMatchedClicked),
+        );
     }
 
     col = col.push(active_dates_row(&files));
@@ -54,7 +60,7 @@ pub fn view(state: &State) -> Element<'static, Message> {
     let (image_groups, unassigned_iterations, leftovers) = group_files(&files, &state.settings.extension_rules);
 
     if image_groups.is_empty() {
-        col = col.push(text("No images in this project yet.").size(12));
+        col = col.push(text("No images in this project yet."));
     }
     for group in &image_groups {
         col = col.push(image_group_view(state, group));
@@ -66,7 +72,7 @@ pub fn view(state: &State) -> Element<'static, Message> {
         for iteration in &unassigned_iterations {
             iter_col = iter_col.push(iteration_view(state, iteration));
         }
-        col = col.push(scrollable(iter_col).height(400.0));
+        col = col.push(style::scrollable(iter_col).height(400.0));
     }
 
     if !leftovers.is_empty() {
@@ -75,10 +81,10 @@ pub fn view(state: &State) -> Element<'static, Message> {
         for file in &leftovers {
             leftover_col = leftover_col.push(file_row(file));
         }
-        col = col.push(scrollable(leftover_col));
+        col = col.push(style::scrollable(leftover_col));
     }
 
-    container(scrollable(col)).into()
+    container(style::scrollable(col)).into()
 }
 
 fn active_dates_row(files: &[ProjectFileView]) -> Element<'static, Message> {
@@ -93,7 +99,7 @@ fn active_dates_row(files: &[ProjectFileView]) -> Element<'static, Message> {
 
     let mut chips = row![text("Active dates:")].spacing(6.0);
     for date in dates {
-        chips = chips.push(container(text(date.format("%Y-%m-%d").to_string()).size(12)).padding(4.0));
+        chips = chips.push(style::panel(text(date.format("%Y-%m-%d").to_string())).padding(4.0));
     }
     chips.into()
 }
